@@ -166,7 +166,7 @@ if($deprecated){
 
             }
 
-            $packages += $packageInfo
+            $deprecatedNugetsExcelFile += $packageInfo
 
         }
 
@@ -228,7 +228,7 @@ if($vulnerable){
 
             }
 
-            $packages += $packageInfo
+            $vulnerableNugetsExcelFile += $packageInfo
 
         }
 
