@@ -1,239 +1,158 @@
 param(
-
     [string]$solutionPath,
-
     [switch]$outdated,
-
     [switch]$deprecated,
-
     [switch]$vulnerable,
-
     [switch]$verbose,
-
     [switch]$all,
-
     [switch]$help
-
 )
 
 function WriteHelp {
-
     Write-Host "Options:"
-
-    Write-Host "  --outdated `t`t`t Write to excel all outdated nugets for the targeted solution"
-
-    Write-Host "  --deprecated `t`t`t Write to excel all deprecated nugets for the targeted solution"
-
-    Write-Host "  --vulnerable `t`t`t Write to excel all vulnerable nugets for the targed solution"
-
-    Write-Host "  --verbose `t`t`t Print to the console all settings that have been selected IE deprecated vulnerable outdated"
-
-    Write-Host "  --all `t`t`t Write to excel all outdated deprecated and vulnerable nugets for the targeted solution"
-
-    Write-Host "  --solutionPath `t`t The path to the solution we want to analyze"
-
+    Write-Host "  --outdated      Write to excel all outdated nugets for the targeted solution"
+    Write-Host "  --deprecated    Write to excel all deprecated nugets for the targeted solution"
+    Write-Host "  --vulnerable    Write to excel all vulnerable nugets for the targeted solution"
+    Write-Host "  --verbose       Print all settings and raw output to console"
+    Write-Host "  --all           Run all (outdated, deprecated, vulnerable)"
+    Write-Host "  --solutionPath  Path to the solution to analyze"
 }
 
-# Initialize an empty array to hold package information
-
-if($all){
-
-    $outdated = $true
-
-    $deprecated = $true
-
-    $vulnerable = $true
-
+function Supports-JsonFormat {
+    try {
+        $test = dotnet list $solutionPath package --format json 
+        return $true
+    }
+    catch {
+        return $false
+    }
 }
 
-if($help){
+function Parse-DotNetListJson {
+    param([string]$flag)
 
-    WriteHelp
+    $json = dotnet list $solutionPath package --$flag --format json
+    if ($verbose) { $json | Write-Host }
+    $data = $json | ConvertFrom-Json
+    $entries = @()
 
-    return
+    foreach ($proj in $data.projects) {
+        foreach ($fw in $proj.frameworks) {
+            foreach ($pkg in $fw.topLevelPackages) {
+                $entry = [PSCustomObject]@{
+                    Project        = $proj.path
+                    Framework      = $fw.framework
+                    PackageName    = $pkg.id
+                    CurrentVersion = $pkg.resolvedVersion
+                }
+                switch ($flag) {
+                    "outdated" {
+                        $entry | Add-Member LatestVersion $pkg.latestVersion
+                    }
+                    "deprecated" {
+                        $entry | Add-Member Reason $pkg.reason
+                        $entry | Add-Member Alternative $pkg.alternative
+                    }
+                    "vulnerable" {
+                        $entry | Add-Member Severity $pkg.vulnerabilities.severity
+                        $entry | Add-Member DocumentationURL $pkg.vulnerabilities.advisoryUrl
 
+                    }
+                }
+                $entries += $entry
+            }
+        }
+    }
+    return $entries
 }
 
-# Initialize a variable to keep track of the current project name
+function Parse-DotNetListTable {
+    param([string]$flag)
 
-if($outdated){
-
-    $outdatedNugetsExcelFile = @()
-
-    Write-Host "Analyzing Outdated Nugets please wait: "
-
-    $outdatedLibs = dotnet list $solutionPath package --outdated
-
+    $output = dotnet list $solutionPath package --$flag
+    if ($verbose) { $output | Write-Host }
+    $entries = @()
     $currentProject = ""
 
-    foreach ($line in $outdatedLibs) {
-
-        if($verbose){
-
-            Write-Host $line
-
+    foreach ($line in $output) {
+        if ($line -match '^Project\s+`?([^`]*)`?$') {
+            $currentProject = $matches[1]
         }
+        elseif ($line -match '^\s*>\s+(\S+)\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?') {
+            $pkg = $matches[1]
+            $ver1 = $matches[2]
+            $ver2 = $matches[3]
+            $ver3 = $matches[4]
 
-        # Use regular expression to match content within single quotes
-
-        if($line.Contains("Project")){
-
-            if ($line -match '`([^`]*)`') {
-
-                # The matched word is captured in the first capture group
-
-                $word = $matches[1]
-
-                $currentProject = $word
-
+            switch ($flag) {
+                "outdated" {
+                    $entries += [PSCustomObject]@{
+                        Project        = $currentProject
+                        PackageName    = $pkg
+                        CurrentVersion = $ver1
+                        LatestVersion  = $ver2
+                    }
+                }
+                "deprecated" {
+                    $entries += [PSCustomObject]@{
+                        Project        = $currentProject
+                        PackageName    = $pkg
+                        CurrentVersion = $ver1
+                        Reason         = $ver2
+                        Alternative    = $ver3
+                    }
+                }
+                "vulnerable" {
+                    $entries += [PSCustomObject]@{
+                        Project         = $currentProject
+                        PackageName     = $pkg
+                        CurrentVersion  = $ver1
+                        Severity        = $ver2
+                        DocumentationURL = $ver3
+                    }
+                }
             }
-
         }
-
-        elseif($line.Contains(">")){
-
-            $words = $line -split '\s+'
-
-            $packageInfo = [PSCustomObject]@{
-
-                Project        = $currentProject
-
-                PackageName    = $words[2]
-
-                CurrentVersion = $words[4]
-
-                LatestVersion  = $words[5]
-
-            }
-
-            $outdatedNugetsExcelFile += $packageInfo
-
-        }
-
     }
-
-    $outdatedNugetsExcelFile | Export-Csv -Path "OutdatedPackages.csv" -NoTypeInformation
-
+    return $entries
 }
 
-if($deprecated){
-
-    $deprecatedNugetsExcelFile = @()
-
-    Write-Host "Analyzing Deprecated Nugets please wait: "
-
-    # Run the command and capture the output
-
-    $deprecatedLibs = dotnet list $solutionPath package --deprecated
-
-    foreach($line in $deprecatedLibs){
-
-        if($verbose){
-
-            Write-Host $line
-
-        }
-
-        if($line.Contains("Project")){
-
-            if ($line -match '`([^`]*)`') {
-
-                # The matched word is captured in the first capture group
-
-                $word = $matches[1]
-
-                $currentProject = $word
-
-            }
-
-        }
-
-        elseif($line.Contains(">")){
-
-            $words = $line -split '\s+'
-
-            $packageInfo = [PSCustomObject]@{
-
-                Project        = $currentProject
-
-                PackageName    = $words[2]
-
-                CurrentVersion = $words[4]
-
-                Reason  = $words[5]
-
-                Alternative = $words[6]
-
-            }
-
-            $deprecatedNugetsExcelFile += $packageInfo
-
-        }
-
-    }
-
-    $deprecatedNugetsExcelFile | Export-Csv -Path "DeprecatedPackages.csv" -NoTypeInformation
-
+# --- Main Logic ---
+if ($help) {
+    WriteHelp
+    return
 }
 
- 
+if ($all) {
+    $outdated = $true
+    $deprecated = $true
+    $vulnerable = $true
+}
 
-if($vulnerable){
+$useJson = Supports-JsonFormat
+if ($verbose) { Write-Host "JSON format supported: $useJson" }
 
-    $vulnerableNugetsExcelFile = @()
-
-    Write-Host "Analyzing Vulnerable Nugets please wait: "
-
-    # Run the command and capture the output
-
-    $vulnerableLibs = dotnet list $solutionPath package --vulnerable
-
-    foreach($line in $vulnerableLibs){
-
-        if($verbose){
-
-            Write-Host $line
-
-        }
-
-         if($line.Contains("Project")){
-
-            if ($line -match '`([^`]*)`') {
-
-                # The matched word is captured in the first capture group
-
-                $word = $matches[1]
-
-                $currentProject = $word
-
-            }
-
-        }
-
-        elseif($line.Contains(">")){
-
-            $words = $line -split '\s+'
-
-            $packageInfo = [PSCustomObject]@{
-
-                Project        = $currentProject
-
-                PackageName    = $words[2]
-
-                CurrentVersion = $words[4]
-
-                Severity  = $words[5]
-
-                DocumentationURL = $words[6]
-
-            }
-
-            $vulnerableNugetsExcelFile += $packageInfo
-
-        }
-
+if ($outdated) {
+    if ($useJson) {
+        Parse-DotNetListJson "outdated" | Export-Csv "OutdatedPackages.csv" -NoTypeInformation
     }
-
-    $vulnerableNugetsExcelFile | Export-Csv -Path "VulnerablePackages.csv" -NoTypeInformation
-
+    else {
+        Parse-DotNetListTable "outdated" | Export-Csv "OutdatedPackages.csv" -NoTypeInformation
+    }
+}
+if ($deprecated) {
+    if ($useJson) {
+        Parse-DotNetListJson "deprecated" | Export-Csv "DeprecatedPackages.csv" -NoTypeInformation
+    }
+    else {
+        Parse-DotNetListTable "deprecated" | Export-Csv "DeprecatedPackages.csv" -NoTypeInformation
+    }
+}
+if ($vulnerable) {
+    if ($useJson) {
+        Parse-DotNetListJson "vulnerable" | Export-Csv "VulnerablePackages.csv" -NoTypeInformation
+    }
+    else {
+        Parse-DotNetListTable "vulnerable" | Export-Csv "VulnerablePackages.csv" -NoTypeInformation
+    }
 }
