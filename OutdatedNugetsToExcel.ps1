@@ -1,4 +1,5 @@
 param(
+    [Parameter(Mandatory = $true)]
     [string]$solutionPath,
     [switch]$outdated,
     [switch]$deprecated,
@@ -9,33 +10,45 @@ param(
 )
 
 function WriteHelp {
-    Write-Host "Options:"
-    Write-Host "  --outdated      Write to excel all outdated nugets for the targeted solution"
-    Write-Host "  --deprecated    Write to excel all deprecated nugets for the targeted solution"
-    Write-Host "  --vulnerable    Write to excel all vulnerable nugets for the targeted solution"
-    Write-Host "  --verbose       Print all settings and raw output to console"
-    Write-Host "  --all           Run all (outdated, deprecated, vulnerable)"
-    Write-Host "  --solutionPath  Path to the solution to analyze"
-}
+    $options = @(
+        @{ Name = "-solutionPath"; Desc = "Path to the solution (.sln) to analyze" },
+        @{ Name = "-outdated";     Desc = "Export all outdated NuGets to CSV" },
+        @{ Name = "-deprecated";   Desc = "Export all deprecated NuGets to CSV" },
+        @{ Name = "-vulnerable";   Desc = "Export all vulnerable NuGets to CSV" },
+        @{ Name = "-all";          Desc = "Run all checks (outdated, deprecated, vulnerable)" },
+        @{ Name = "-help";         Desc = "Show this help message" }
+    )
 
-function Supports-JsonFormat {
-    try {
-        $test = dotnet list $solutionPath package --format json 
-        return $true
+    $maxNameLen = ($options | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
+
+    Write-Host "`nOptions:`n"
+    foreach ($opt in $options) {
+        $padded = $opt.Name.PadRight($maxNameLen + 2)
+        Write-Host ("  {0}{1}" -f $padded, $opt.Desc)
     }
-    catch {
-        return $false
-    }
+
+    Write-Host "`nExamples:`n"
+    Write-Host "  .\NugetAudit.ps1 -solutionPath MyApp.sln -outdated"
+    Write-Host "  .\NugetAudit.ps1 -solutionPath MyApp.sln -all`n"
 }
 
 function Parse-DotNetListJson {
-    param([string]$flag)
+    param(
+        [string]$flag,
+        [string]$solutionPath
+    )
 
-    $json = dotnet list $solutionPath package --$flag --format json
-    if ($verbose) { $json | Write-Host }
-    $data = $json | ConvertFrom-Json
+    try {
+        Write-Verbose "Running: dotnet list $solutionPath package --$flag --format json"
+        $json = dotnet list $solutionPath package --$flag --format json 2>&1
+        $data = $json | ConvertFrom-Json
+    }
+    catch {
+        Write-Error "Failed to run 'dotnet list package --$flag'. Details: $_"
+        return @()
+    }
+
     $entries = @()
-
     foreach ($proj in $data.projects) {
         foreach ($fw in $proj.frameworks) {
             foreach ($pkg in $fw.topLevelPackages) {
@@ -45,18 +58,21 @@ function Parse-DotNetListJson {
                     PackageName    = $pkg.id
                     CurrentVersion = $pkg.resolvedVersion
                 }
+
                 switch ($flag) {
                     "outdated" {
                         $entry | Add-Member LatestVersion $pkg.latestVersion
                     }
                     "deprecated" {
-                        $entry | Add-Member Reason $pkg.reason
-                        $entry | Add-Member Alternative $pkg.alternative
+                        $entry | Add-Member Reason (($pkg.deprecationReasons -join "; "))
+                        $alt = if ($pkg.alternativePackage) {
+                            $pkg.alternativePackage.id + $(if ($pkg.alternativePackage.versionRange) { " " + $pkg.alternativePackage.versionRange })
+                        } else { "None found" }
+                        $entry | Add-Member Alternative $alt
                     }
                     "vulnerable" {
-                        $entry | Add-Member Severity $pkg.vulnerabilities.severity
-                        $entry | Add-Member DocumentationURL $pkg.vulnerabilities.advisoryUrl
-
+                        $entry | Add-Member Severity ($pkg.vulnerabilities.severity -join "; ")
+                        $entry | Add-Member DocumentationURL ($pkg.vulnerabilities.advisoryurl -join "; ")
                     }
                 }
                 $entries += $entry
@@ -65,94 +81,97 @@ function Parse-DotNetListJson {
     }
     return $entries
 }
+function Test-SdkStyleProjects {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$solutionPath
+    )
 
-function Parse-DotNetListTable {
-    param([string]$flag)
+    # Ensure the solution file exists
+    if (-not (Test-Path $solutionPath -PathType Leaf)) {
+        Write-Error "Solution path '$solutionPath' does not exist."
+        return $false
+    }
 
-    $output = dotnet list $solutionPath package --$flag
-    if ($verbose) { $output | Write-Host }
-    $entries = @()
-    $currentProject = ""
+    $solutionDir = Split-Path $solutionPath
 
-    foreach ($line in $output) {
-        if ($line -match '^Project\s+`?([^`]*)`?$') {
-            $currentProject = $matches[1]
-        }
-        elseif ($line -match '^\s*>\s+(\S+)\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?') {
-            $pkg = $matches[1]
-            $ver1 = $matches[2]
-            $ver2 = $matches[3]
-            $ver3 = $matches[4]
+    # Find all .csproj files
+    $csprojFiles = Get-ChildItem -Path $solutionDir -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue
 
-            switch ($flag) {
-                "outdated" {
-                    $entries += [PSCustomObject]@{
-                        Project        = $currentProject
-                        PackageName    = $pkg
-                        CurrentVersion = $ver1
-                        LatestVersion  = $ver2
-                    }
-                }
-                "deprecated" {
-                    $entries += [PSCustomObject]@{
-                        Project        = $currentProject
-                        PackageName    = $pkg
-                        CurrentVersion = $ver1
-                        Reason         = $ver2
-                        Alternative    = $ver3
-                    }
-                }
-                "vulnerable" {
-                    $entries += [PSCustomObject]@{
-                        Project         = $currentProject
-                        PackageName     = $pkg
-                        CurrentVersion  = $ver1
-                        Severity        = $ver2
-                        DocumentationURL = $ver3
-                    }
-                }
+    if ($csprojFiles.Count -eq 0) {
+        Write-Error "No .csproj files found in solution directory."
+        return $false
+    }
+    # Filter for SDK-style projects
+    $sdkProjects = @()
+    foreach ($proj in $csprojFiles) {
+        try {
+            [xml]$xml = Get-Content $proj.FullName
+            if ($xml.Project.Sdk) {
+                Write-Verbose "found $($proj) "
+                $sdkProjects += $proj
+            }else{
+                Write-Verbose "found non sdk project $($proj)"
             }
         }
+        catch {
+            Write-Warning "Failed to parse $($proj.FullName) as XML."
+            return $false
+        }
     }
-    return $entries
+
+    if ($sdkProjects.Count -ne $csprojFiles.Count) {
+        Write-Error "Non SDK-style .csproj files found. This script only works on SDK-style projects."
+        return $false
+    }
+
+    Write-Verbose "Found $($sdkProjects.Count) SDK-style project(s)."
+    return $true
+}
+
+function Export-Results {
+    param(
+        [string]$flag,
+        [array]$data
+    )
+
+    if ($data.Count -eq 0) {
+        Write-Host "No $flag packages found."
+        return
+    }
+
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $file = "${flag}Packages_$timestamp.csv"
+    $data | Export-Csv $file -NoTypeInformation -Encoding UTF8
+    Write-Host "✅ Exported $flag results to $file"
 }
 
 # --- Main Logic ---
-if ($help) {
+if ($help -or (-not $solutionPath)) {
     WriteHelp
     return
 }
 
+if (-not (Test-Path $solutionPath)) {
+    Write-Error "Solution path '$solutionPath' not found."
+    return
+}
+
+
+if(-not $outdated -and -not $deprecated -and -not $vulnerable -and -not $all){
+    $outdated = $true
+}
 if ($all) {
     $outdated = $true
     $deprecated = $true
     $vulnerable = $true
 }
+if (-not (Test-SdkStyleProjects -solutionPath $solutionPath)) {
+    return
+}
 
-$useJson = Supports-JsonFormat
-if ($verbose) { Write-Host "JSON format supported: $useJson" }
 
-if ($outdated) {
-    if ($useJson) {
-        Parse-DotNetListJson "outdated" | Export-Csv "OutdatedPackages.csv" -NoTypeInformation
-    }
-    else {
-        Parse-DotNetListTable "outdated" | Export-Csv "OutdatedPackages.csv" -NoTypeInformation
-    }
-}
-if ($deprecated) {
-    if ($useJson) {
-        Parse-DotNetListJson "deprecated" | Export-Csv "DeprecatedPackages.csv" -NoTypeInformation
-    }
-    else {
-        Parse-DotNetListTable "deprecated" | Export-Csv "DeprecatedPackages.csv" -NoTypeInformation
-    }
-}
-if ($vulnerable) {
-    if ($useJson) {
-        Parse-DotNetListJson "vulnerable" | Export-Csv "VulnerablePackages.csv" -NoTypeInformation
-    }
-    else {
-        Parse-DotNetListTable "vulnerable" | Export-Csv "VulnerablePackages.csv" -NoTypeInformation
-    }
-}
+if ($outdated)   { Export-Results "Outdated"   (Parse-DotNetListJson "outdated"   $solutionPath) }
+if ($deprecated) { Export-Results "Deprecated" (Parse-DotNetListJson "deprecated" $solutionPath) }
+if ($vulnerable) { Export-Results "Vulnerable" (Parse-DotNetListJson "vulnerable" $solutionPath) }
+
