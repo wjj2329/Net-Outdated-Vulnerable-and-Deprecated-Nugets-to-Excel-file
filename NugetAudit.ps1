@@ -4,7 +4,6 @@ param(
     [switch]$outdated,
     [switch]$deprecated,
     [switch]$vulnerable,
-    [switch]$verbose,
     [switch]$all,
     [switch]$help
 )
@@ -15,6 +14,7 @@ function WriteHelp {
         @{ Name = "-outdated";     Desc = "Export all outdated NuGets to CSV" },
         @{ Name = "-deprecated";   Desc = "Export all deprecated NuGets to CSV" },
         @{ Name = "-vulnerable";   Desc = "Export all vulnerable NuGets to CSV" },
+        @{ Name = "-verbose";      Desc = "Print all settings and raw output to console" },
         @{ Name = "-all";          Desc = "Run all checks (outdated, deprecated, vulnerable)" },
         @{ Name = "-help";         Desc = "Show this help message" }
     )
@@ -148,6 +148,7 @@ function Export-Results {
 
 # --- Main Logic ---
 if ($help -or (-not $solutionPath)) {
+    Write-Host "Hello"
     WriteHelp
     return
 }
